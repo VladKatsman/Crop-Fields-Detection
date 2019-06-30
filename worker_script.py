@@ -8,4 +8,4 @@ if __name__ == '__main__':
     grid='/data/dev/grids/06-21_09:17.jpg'
     center='31.060685,74.087856'
     main(exp_dir=exp_dir, output_dir=output_dir, arch=arch, grid=grid, center=center)
-    os.system('sudo shutdown')
+    # os.system('sudo shutdown')
