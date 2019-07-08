@@ -1,11 +1,16 @@
 import os
+from tqdm import tqdm
 from field_boundaries.ricult_boundary_engine import main
 
 if __name__ == '__main__':
-    exp_dir = '/data/dev/models/denseunet'
-    output_dir='/data/experiments/result'
-    arch='densenet_unet.DensenetUnet(seg_classes=3)'
-    grid='/data/dev/grids/06-21_09:17.jpg'
-    center='31.060685,74.087856'
-    main(exp_dir=exp_dir, output_dir=output_dir, arch=arch, grid=grid, center=center)
-    # os.system('sudo shutdown')
+    model_path = '/data/dev/models/denseunet'
+    output_dir = '/data/experiments/result'
+    json_path = '/data/dev/models/denseunet'
+    arch = 'densenet_unet.DensenetUnet(seg_classes=3)'
+
+    with open(json_path, 'w') as json_file:
+        points_list = json_file['points']
+    for i in tqdm(range(len(points_list))):
+        points = points_list[i]
+        main(model_path=model_path, output_dir=output_dir, arch=arch, grid_name=i, points=points)
+    os.system('sudo shutdown')

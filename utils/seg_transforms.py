@@ -5,7 +5,6 @@ import random
 import cv2
 import imgaug as iaa
 
-from torch.nn import functional as tf
 from torchvision.transforms import functional
 from PIL import Image
 from imgaug import augmenters as iaa

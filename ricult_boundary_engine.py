@@ -1,11 +1,14 @@
 import os
 import json
+import time
 
 import warnings
 import numpy as np
+import cv2
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 
@@ -16,23 +19,23 @@ import torchvision.transforms as transforms
 import torchvision.models as models
 
 from PIL import Image
-from tqdm import tqdm
-from field_boundaries.utils.obj_factory import obj_factory
-from field_boundaries.utils import seg_utils
-from field_boundaries.utils.postprocessing import process_mask, BoundaryHandler
-from google_maps_python.map_utils import polygon_to_url
+from multiprocessing import Pool
+from utils.obj_factory import obj_factory
+from utils import seg_utils
+from utils.postprocessing import process_mask, BoundaryHandler
+from utils.data_utils import create_grid_prod
 
 
 # remove
 Image.MAX_IMAGE_PIXELS = None
 
 
-def main(exp_dir='/data/experiments', output_dir='/data/experiments', gpus=None, arch='resnet18', grid='/data',
-         center=[0, 0]):
+def main(model_path='/data/experiments', output_dir='/data/experiments', gpus=None, arch='resnet18', grid_name=1,
+         points=[[10, 20, 0, 20], [40, 20, 40, 0]], size=384, stride=342, batch_size=16, num_workers=10):
 
     # Check dir
-    if not os.path.isdir(exp_dir):
-        raise RuntimeError('Experiment directory was not found: \'' + exp_dir + '\'')
+    if not os.path.isdir(model_path):
+        raise RuntimeError('Experiment directory was not found: \'' + model_path + '\'')
     warnings.filterwarnings("ignore", category=UserWarning)
 
     # Check CUDA device availability
@@ -54,9 +57,9 @@ def main(exp_dir='/data/experiments', output_dir='/data/experiments', gpus=None,
     model.to(device)
 
     # Load weights
-    checkpoint_dir = exp_dir
-    # model_path = os.path.join(checkpoint_dir, 'model_best.pth')
-    model_path = os.path.join(checkpoint_dir, 'model_latest.pth')
+    checkpoint_dir = model_path
+    # model_path = os.path.join(checkpoint_dir, 'model_best.pth')  # predicts sand areas as fields
+    model_path = os.path.join(checkpoint_dir, 'model_latest.pth')  # doens predict sand areas as fields
     if os.path.isfile(model_path):
         print("=> loading checkpoint from '{}'".format(checkpoint_dir))
         checkpoint = torch.load(model_path)
@@ -66,94 +69,131 @@ def main(exp_dir='/data/experiments', output_dir='/data/experiments', gpus=None,
     if gpus and len(gpus) > 1:
         model = nn.DataParallel(model, gpus)
 
+    # eval mode
+    model.eval()
+    torch.set_grad_enabled(False)
+
     # if input shape are the same for the dataset then set to True, otherwise False
     cudnn.benchmark = True
 
-    # open grid
-    grid = np.array(Image.open(grid))
+    # convert points string to list of floats
+    points = [float(p) for p in points.split(',')]
 
-    # evaluate
-    validate(model, device, output_dir, grid, tensor_transforms, center)
+    # download grid
+    # p1 = time.time()
+    grids_container, center, h_grid_out, w_grid_out = create_grid_prod(points,
+                                                                       output_path="{}/grids".format(output_dir),
+                                                                       name=grid_name)
 
+    # preprocess grid and initiate constants
+    size = size
+    stride = stride
+    crop = (size - stride) // 2
+    batch_size = batch_size
 
-def validate(model, device, output_dir, grid, tensor_transforms, center):
+    # we can process data in batches of 16 more efficiently
+    H = W = 5514  # shape of the image in order to get 16x16 crops of size=384
+    H1 = W1 = 5514 - crop * 2
 
-    # init post processing class
-    crop = 21
-    crop_size = 384
-    step = 342
-    height = grid.shape[0]
-    num_crops_in_row = (height - crop_size) // step
-    height_f = num_crops_in_row * step + crop_size
-    center = center.split(',')
-    center = float(center[0]), float(center[1])
-    postproc = BoundaryHandler(center=center, grid_size=height, crop=crop)
+    # initiate CPU post-processing module
+    post_proc = BoundaryHandler(center, simplify_thresh=0.01, zoom=18)
+    pool = Pool(processes=num_workers)
 
-    # init empty image
-    final_res = np.zeros((height_f, height_f, 3)).astype(np.uint8)
-    final_mask = np.zeros((height_f, height_f)).astype(np.uint8)
+    # initiate polygons container
     json_file = {'polygons': []}
 
-    # switch to evaluate mode
-    model.train(False)
-    with torch.no_grad():
-        for i in tqdm(range(num_crops_in_row)):
-            for j in range(num_crops_in_row):
-                image = grid[i * step:crop_size + i * step,
-                             j * step:crop_size + j * step]
-                image = Image.fromarray(image.astype(np.uint8))
-                inputs = tensor_transforms(image)
-                inputs = inputs.unsqueeze(0)
-                inputs = inputs.to(device)
+    # iterate over grid
+    N = len(grids_container)
+    for n in range(N):
 
-                # compute output of the model
-                output = model(inputs)
+        # open grid and coordinates anchors to regain actual coordinate values from the pixel values
+        grid_path, h_cor, w_cor = grids_container[n]
+        grid = cv2.imread(grid_path)[:,:,::-1]  # swap BGR to RGB
 
-                # update metrics
-                pred = output.data.max(1)[1].cpu().numpy()
+        # check for padding (we pad bot and right) in order to split to batches of 16 images
+        h, w = grid.shape[:2]
+        h_pad = (H % h)
+        w_pad = (W % w)
 
-                # opening/closing + find contours
-                mask = pred[0]
-                mask = np.array(mask)
-                mask = process_mask(mask)
-                if len(mask) == 0:
-                    image = np.array(image)
-                    image = image[crop:-crop, crop:-crop, :]
-                    final_res[step * i:step * (i + 1), step * j: step * (j + 1), :] = image.astype(np.uint8)
-                    continue
-                # making mask colorfull
-                color = [0, 255, 255]
+        # move grid to PIL in order to use further (requires some memory)
+        grid = Image.fromarray(grid.astype(np.uint8))
 
-                # using blending to concatenate mask and image
-                img_with_mask = seg_utils.alpha_blend(image, color, mask, val=False)
+        # move grid to tensor, normalization
+        tensor = tensor_transforms(grid)
 
-                # crop mask (there is a memory error)
-                mask = mask[crop:-crop, crop:-crop]
-                final_mask[step * i:step * (i + 1), step * j: step * (j + 1)] = mask.astype(np.uint8)
+        # if pad is not zero
+        if h_pad or w_pad:
+            tensor = F.pad(tensor, (0, w_pad, 0, h_pad))
 
-                # crop image on edges
-                img_crop = img_with_mask[crop:-crop, crop:-crop, :]
-                final_res[step*i:step*(i+1), step*j: step*(j+1), :] = img_crop.astype(np.uint8)
+        # split tensor to patches and patches to batches
+        patches = tensor.unfold(1, size, stride).unfold(2, size, stride)  # should work for the tensor C x H x W
 
+        # permute in order to retrieve information further
+        patches = patches.permute(1, 2, 0, 3, 4)
 
-    # crop boundaries
-    final_res = final_res[crop:-crop, crop:-crop, :]  # probably to make sure no small segments are included
+        # create empty tensor
+        gpu_container = torch.empty(batch_size, batch_size, size, size)
 
-    # save blended image
-    final_res = Image.fromarray(final_res.astype(np.uint8))
-    final_res.save(os.path.join(output_dir, "result.jpg"))
+        # GPU part
+        # p1 = time.time()
+        for i in range(batch_size):
+            input = patches[i].to(device)
+            output = model(input)
+            preds = output.data.max(1)[1].cpu()
+            # transfer preds from GPU to CPU and send predictions to container
+            gpu_container[i] = preds
+        # p2 = time.time() - p1
 
-    # find contours
-    final_mask = final_mask[crop:-crop, crop:-crop].astype(np.uint8)
-    json_file['polygons'] = postproc.get_coordinates(final_mask)
+        # CPU part
+        cpu_container = np.zeros((16, 16, 384, 384)).astype(np.uint8)
+        predictions = np.array(gpu_container).astype(np.uint8)
+        for i in range(batch_size):
+            res = pool.map(process_mask, predictions[i])
+            if len(cpu_container) == 0:
+                # there is no farms found
+                continue
+            cpu_container[i] = np.stack(res, axis=0)
 
-    # tmp
-    # polygon_to_url(json_file['polygons'][100])
+        # remove grids overlapping introduced before and reconstruct area of the sub grid
+        result = torch.from_numpy(cpu_container)
+        result = result[:, :, crop:-crop, crop:-crop]
+        result = result.permute(0, 2, 1, 3).contiguous().view(H1, W1)
 
-    # save json
-    annotation_path_v = "{}/{}_{}.json".format(args.output_dir, center[0], center[1])
+        # remove predictions from zero-pad area (bot and right)
+        result = result[:H1 - h_pad, :W1 - w_pad]
+
+        # remove predictions from the last padded sub grids if there are
+        if h_grid_out and h != 5120:
+            result = result[:, :h_grid_out, :]
+        if w_grid_out and w != 5120:
+            result = result[:, :, w_grid_out]
+
+        # drop very small sub grids
+        if result.shape[0] < 3 or result.shape[1] < 3:
+            continue
+        # finally find contours and polygons
+        array = np.array(result).astype(np.uint8)
+        polygons = post_proc.get_coordinates(array, h_cor, w_cor)
+        json_file['polygons'].append(polygons)
+
+        # tmp draw result for debug
+        # color = [0, 255, 255]
+        #
+        # # using blending to concatenate mask and image
+        # image = np.array(grid).astype(np.uint8)
+        # image = image[crop:-crop, crop:-crop, :]
+        # mask = np.array(result).astype(np.uint8)
+        # img_with_mask = seg_utils.alpha_blend(image, color, mask, val=False)
+        #
+        # final_res = Image.fromarray(img_with_mask.astype(np.uint8))
+        # save_name = grid_path.split('/')[-1]
+        # final_res.save(os.path.join(output_dir, "result_{}".format(save_name)))
+
+    # save json file
+    annotation_path_v = "{}/{}_{}.json".format(output_dir, center[0], center[1])
     with open(annotation_path_v, 'w') as output_json_file:
         json.dump(json_file, output_json_file)
+    # print(time.time() - p1)
 
 
 if __name__ == "__main__":
@@ -165,8 +205,8 @@ if __name__ == "__main__":
     model_names = sorted(name for name in models.__dict__
                          if name.islower() and not name.startswith("__")
                          and callable(models.__dict__[name]))
-    parser.add_argument('exp_dir',
-                        help='path to experiment directory')
+    parser.add_argument('--model_path',
+                        help='path to directory with a trained model')
     parser.add_argument('--output_dir', default=None, type=str, metavar='DIR',
                         help='path to directory to save predicted masks on images')
     parser.add_argument('--gpus', default=None, nargs='+', type=int, metavar='N',
@@ -175,9 +215,10 @@ if __name__ == "__main__":
                         help='model architecture: ' +
                              ' | '.join(model_names) +
                              ' (default: resnet18)')
-    parser.add_argument('--grid', default=None, type=str, metavar='DIR',
-                        help='path to directory with a grid image')
-    parser.add_argument('--center',
-                        help='coordinates of center point of the grid image')
+    parser.add_argument('--grid_name', default=None, type=str, metavar='DIR',
+                        help='name of the grid file')
+    parser.add_argument('--points',
+                        help='list of lists of coordinates in the next format [[x0, y0, x1, y1],...]')
     args = parser.parse_args()
-    main(args.exp_dir, output_dir=args.output_dir, gpus=args.gpus, arch=args.arch, grid=args.grid, center=args.center)
+    main(model_path=args.model_path, output_dir=args.output_dir, gpus=args.gpus, arch=args.arch, grid_name=args.grid_name,
+         points=args.points)
